@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    https://pstream.mov/
-// @version      1.0.0
+// @version      1.0.1
 // @description  Userscript replacement for the P-Stream extension
 // @author       Duplicake, P-Stream Team
 // @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
@@ -45,6 +45,7 @@
 
   const STREAM_RULES = new Map();
   const MEDIA_BLOBS = new Map();
+  const PROXY_CACHE = new Map();
   let fetchPatched = false;
   let xhrPatched = false;
   let mediaPatched = false;
@@ -210,39 +211,55 @@
   const proxyMediaIfNeeded = async (url) => {
     const normalized = normalizeUrl(url);
     if (!normalized) return null;
+    
+    // Check cache first
+    if (PROXY_CACHE.has(normalized)) {
+      return PROXY_CACHE.get(normalized);
+    }
+    
     const rule = findRuleForUrl(normalized);
     if (!rule) return null;
-    try {
-      const includeCredentials = shouldSendCredentials(normalized, 'include', true);
-      const response = await gmRequest({
-        url: normalized,
-        method: 'GET',
-        headers: rule.requestHeaders,
-        responseType: 'arraybuffer',
-        withCredentials: includeCredentials,
-      });
-      const headers = parseHeaders(response.responseHeaders);
-      const contentType = headers['content-type'] || '';
+    
+    // Create promise and cache it immediately to prevent duplicate requests
+    const proxyPromise = (async () => {
+      try {
+        const includeCredentials = shouldSendCredentials(normalized, 'include', true);
+        const response = await gmRequest({
+          url: normalized,
+          method: 'GET',
+          headers: rule.requestHeaders,
+          responseType: 'arraybuffer',
+          withCredentials: includeCredentials,
+        });
+        const headers = parseHeaders(response.responseHeaders);
+        const contentType = headers['content-type'] || '';
 
-      if (
-        contentType.includes('application/vnd.apple.mpegurl') ||
-        contentType.includes('application/x-mpegurl') ||
-        normalized.includes('.m3u8')
-      ) {
+        if (
+          contentType.includes('application/vnd.apple.mpegurl') ||
+          contentType.includes('application/x-mpegurl') ||
+          normalized.includes('.m3u8')
+        ) {
+          return null;
+        }
+        if (contentType.includes('application/dash+xml') || normalized.includes('.mpd')) return null;
+
+        const blobUrl = makeBlobUrl(
+          response.response instanceof ArrayBuffer ? response.response : new TextEncoder().encode(response.responseText ?? ''),
+          contentType,
+        );
+        MEDIA_BLOBS.set(blobUrl, true);
+        return blobUrl;
+      } catch (err) {
+        log('Media proxy failed, falling back to original src', err);
         return null;
+      } finally {
+        // Remove from cache after a short delay
+        setTimeout(() => PROXY_CACHE.delete(normalized), 1000);
       }
-      if (contentType.includes('application/dash+xml') || normalized.includes('.mpd')) return null;
-
-      const blobUrl = makeBlobUrl(
-        response.response instanceof ArrayBuffer ? response.response : new TextEncoder().encode(response.responseText ?? ''),
-        contentType,
-      );
-      MEDIA_BLOBS.set(blobUrl, true);
-      return blobUrl;
-    } catch (err) {
-      log('Media proxy failed, falling back to original src', err);
-      return null;
-    }
+    })();
+    
+    PROXY_CACHE.set(normalized, proxyPromise);
+    return proxyPromise;
   };
 
   // --- Proxy initializers ------------------------------------------------
@@ -567,22 +584,33 @@
     if (srcDescriptor && srcDescriptor.set) {
       Object.defineProperty(win.HTMLMediaElement.prototype, 'src', {
         ...srcDescriptor,
-        async set(value) {
+        set(value) {
           if (typeof value === 'string') {
-            const proxied = await proxyMediaIfNeeded(value);
-            return srcDescriptor.set.call(this, proxied || value);
+            // Start proxying in background but set original URL immediately
+            proxyMediaIfNeeded(value).then(proxied => {
+              if (proxied && this.src === value) {
+                // Only update if src hasn't changed
+                srcDescriptor.set.call(this, proxied);
+              }
+            });
+            return srcDescriptor.set.call(this, value);
           }
           return srcDescriptor.set.call(this, value);
         },
       });
     }
 
-    // Only override setAttribute on media elements to improve performance
+    // CRITICAL FIX: Keep setAttribute synchronous
     const originalMediaSetAttribute = win.HTMLMediaElement.prototype.setAttribute;
-    win.HTMLMediaElement.prototype.setAttribute = async function (name, value) {
+    win.HTMLMediaElement.prototype.setAttribute = function (name, value) {
       if (typeof name === 'string' && name.toLowerCase() === 'src' && typeof value === 'string') {
-        const proxied = await proxyMediaIfNeeded(value);
-        return originalMediaSetAttribute.call(this, name, proxied || value);
+        // Start proxying in background but set attribute immediately
+        proxyMediaIfNeeded(value).then(proxied => {
+          if (proxied && this.getAttribute('src') === value) {
+            // Only update if src attribute hasn't changed
+            originalMediaSetAttribute.call(this, name, proxied);
+          }
+        });
       }
       return originalMediaSetAttribute.call(this, name, value);
     };
@@ -597,6 +625,21 @@
     ensureFetchProxy();
     ensureXhrProxy();
     ensureMediaProxy();
+  };
+
+  // --- Cleanup helper ----------------------------------------------------
+  const cleanupOldStreamData = () => {
+    // Clear old blob URLs
+    MEDIA_BLOBS.forEach((_, blobUrl) => {
+      try {
+        URL.revokeObjectURL(blobUrl);
+      } catch (err) {
+        log('Failed to revoke blob URL', err);
+      }
+    });
+    MEDIA_BLOBS.clear();
+    PROXY_CACHE.clear();
+    log('Cleaned up old stream data');
   };
 
   // --- Message handlers --------------------------------------------------
@@ -655,6 +698,10 @@
 
   const handlePrepareStream = async (reqBody) => {
     if (!reqBody) throw new Error('No request body found in the request.');
+    
+    // Clean up old stream data before preparing new stream
+    cleanupOldStreamData();
+    
     const responseHeaders = Object.entries(reqBody.responseHeaders ?? {}).reduce((acc, [k, v]) => {
       const key = k.toLowerCase();
       if (MODIFIABLE_RESPONSE_HEADERS.includes(key)) acc[key] = v;
@@ -665,6 +712,8 @@
       ...reqBody,
       responseHeaders,
     });
+    
+    log('Stream prepared:', reqBody.ruleId);
     ensureAllProxies();
     return { success: true };
   };
