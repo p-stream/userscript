@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    https://pstream.mov/
-// @version      1.0.2
+// @version      1.0.3
 // @description  Userscript replacement for the P-Stream extension
 // @author       Duplicake, P-Stream Team
 // @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
@@ -48,6 +48,8 @@
   const ELEMENT_BLOBS = new WeakMap(); // element -> blobUrl
   const ELEMENT_PENDING_REQUESTS = new WeakMap(); // element -> Set of pending request URLs
   const PROXY_CACHE = new Map();
+  // Blacklist of sources that fail to play with userscript but work with extension
+  const SOURCE_BLACKLIST = new Set(['fsharetv.co', 'lmscript.xyz']);
   let fetchPatched = false;
   let xhrPatched = false;
   let mediaPatched = false;
@@ -190,6 +192,13 @@
     const normalized = normalizeUrl(url);
     if (!normalized) return null;
     const host = new URL(normalized).hostname;
+
+    // Check if the hostname is in the blacklist
+    if (SOURCE_BLACKLIST.has(host)) {
+      log('Skipping blacklisted source:', host);
+      return null;
+    }
+
     for (const rule of STREAM_RULES.values()) {
       if (rule.targetDomains?.some((d) => host === d || host.endsWith(`.${d}`))) return rule;
       if (rule.targetRegex) {
@@ -941,6 +950,17 @@
   const handleMakeRequest = async (reqBody) => {
     if (!reqBody) throw new Error('No request body found in the request.');
     const url = makeFullUrl(reqBody.url, reqBody);
+
+    // Check if the URL is from a blacklisted source
+    const normalized = normalizeUrl(url);
+    if (normalized) {
+      const host = new URL(normalized).hostname;
+      if (SOURCE_BLACKLIST.has(host)) {
+        log('Blocking blacklisted source request:', host);
+        throw new Error(`Request blocked: ${host} is blacklisted`);
+      }
+    }
+
     const includeCredentials = shouldSendCredentials(url, reqBody.credentials, reqBody.withCredentials);
 
     const response = await gmRequest({
